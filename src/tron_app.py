@@ -43,9 +43,7 @@ def play_live(
         seed=seed,
     )
     view = GameView(model, scale=scale, fps=fps)
-    controller: Controller = (
-        KeyStateController(view.pressed, human_players=range(players)) if human else GreedySpaceController()
-    )
+    controller: Controller = KeyStateController(view.pressed, human_players={0} if human else set(), fallback=GreedySpaceController())
 
     try:
         while view.poll():
