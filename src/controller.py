@@ -42,6 +42,9 @@ class GreedySpaceController:
     Useful for demos, debugging, and weak scripted opponents.
     """
 
+    def observation_type(self) -> str:
+        return "lite"
+
     def actions(self, model: Any) -> np.ndarray:
         scores = np.stack([self._ray_score(model, a) for a in range(3)], axis=2)
         return scores.argmax(axis=2).astype(np.int8)
