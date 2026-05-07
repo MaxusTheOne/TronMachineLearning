@@ -2,10 +2,10 @@
 Learned-agent and LLM-facing adapters for the Tron environment.
 
 This file intentionally stays separate from the core MVC files:
-- tron_model.py: fast environment simulation
-- tron_controller.py: scripted and keyboard controllers
-- tron_view.py: rendering
-- tron_app.py: runnable demos / CLI
+- model.py: fast environment simulation
+- controller.py: scripted and keyboard controllers
+- view.py: rendering
+- app.py: runnable demos / CLI
 
 Action encoding:
     0 = straight, 1 = turn left, 2 = turn right
@@ -17,7 +17,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from tron_controller import Controller, GreedySpaceController
+from controller import Controller, GreedySpaceController
 
 
 class AgentAdapter:

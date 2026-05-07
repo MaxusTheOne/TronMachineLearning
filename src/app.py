@@ -2,11 +2,11 @@
 Runnable app / demo layer for the modular Tron project.
 
 Run examples:
-    python tron_app.py --mode watch --players 4
-    python tron_app.py --mode human --players 2
-    python tron_app.py --mode replay --players 4
-    python tron_app.py --mode benchmark --envs 10000 --steps 1000
-    python tron_app.py --mode train-skeleton
+    python app.py --mode watch --players 4
+    python app.py --mode human --players 2
+    python app.py --mode replay --players 4
+    python app.py --mode benchmark --envs 10000 --steps 1000
+    python app.py --mode train-skeleton
 
 Dependencies:
     pip install numpy
@@ -20,9 +20,9 @@ import argparse
 import time
 from typing import Optional
 
-from tron_controller import Controller, GreedySpaceController, KeyStateController, RandomController
-from tron_model import Replay, TronBatchModel
-from tron_view import GameView
+from controller import Controller, GreedySpaceController, KeyStateController, RandomController
+from model import Replay, TronBatchModel
+from view import GameView
 
 
 def play_live(

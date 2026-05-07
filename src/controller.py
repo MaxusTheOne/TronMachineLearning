@@ -12,7 +12,7 @@ from typing import Any, Iterable, Optional, Protocol
 import numpy as np
 import time
 
-from tron_model import DIR_VECTORS, TURN
+from model import DIR_VECTORS, TURN
 
 
 class Controller(Protocol):

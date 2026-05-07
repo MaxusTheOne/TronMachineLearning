@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 
-from tron_model import Replay
+from model import Replay
 
 
 class GameView:
