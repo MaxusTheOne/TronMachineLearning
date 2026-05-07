@@ -2,3 +2,8 @@
 .idea
 __pycache__
 *.egg-info
+
+checkpoints/*
+tron_genomes\*
+/src/checkpoints
+/src/tron_genomes
