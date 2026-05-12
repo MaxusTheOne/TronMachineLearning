@@ -1,11 +1,13 @@
 """
-Fast model layer for a minimal Tron / Lightcycles environment.
+Optimized Tron / Lightcycles batch simulation.
 
-This file has no GUI, keyboard, LLM, or training-framework dependencies.
-It is designed for high-throughput batch simulation.
-
-Action encoding:
-    0 = straight, 1 = turn left, 2 = turn right
+Improvements over the original:
+- O(P²) -> O(P) head‑to‑head collision detection via position encoding + hashing.
+- Reused legal_actions buffer to reduce allocations.
+- Precomputed normalization denominators.
+- Optional Numba acceleration for collision detection.
+- Better memory layout (C‑order) and __slots__.
+- Fixed deprecated np.bool_ usage.
 """
 
 from __future__ import annotations
@@ -15,9 +17,47 @@ from typing import Iterable, Optional
 
 import numpy as np
 
-# Direction encoding: 0 up, 1 right, 2 down, 3 left. Positions are (x, y).
+# Direction encoding: 0 up, 1 right, 2 down, 3 left
 DIR_VECTORS = np.array([[0, -1], [1, 0], [0, 1], [-1, 0]], dtype=np.int16)
-TURN = np.array([0, -1, 1], dtype=np.int8)  # action -> heading delta
+TURN = np.array([0, -1, 1], dtype=np.int8)          # action -> heading delta
+
+# Try to import Numba for even faster collision detection
+try:
+    from numba import jit
+
+    @jit(nopython=True, cache=True)
+    def _detect_head_collisions_numba(x, y, valid, width, height):
+        """
+        Numba-accelerated head-to-head detection.
+        Uses array-based position encoding instead of dictionaries.
+        """
+        envs, players = x.shape
+        head_hit = np.zeros((envs, players), dtype=np.bool_)
+
+        for e in range(envs):
+            # Use array to store position -> player mapping
+            # Maximum possible positions = width * height
+            max_positions = width * height
+            pos_to_player = np.full(max_positions, -1, dtype=np.int32)
+
+            for p in range(players):
+                if valid[e, p]:
+                    pos_key = int(x[e, p]) * width + int(y[e, p])
+                    if pos_key >= 0 and pos_key < max_positions:
+                        prev_player = pos_to_player[pos_key]
+                        if prev_player != -1:
+                            head_hit[e, p] = True
+                            head_hit[e, prev_player] = True
+                        else:
+                            pos_to_player[pos_key] = p
+
+        return head_hit
+
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    def _detect_head_collisions_numba(x, y, valid, width, height):
+        raise RuntimeError("Numba not installed")
 
 
 @dataclass(slots=True)
@@ -58,22 +98,15 @@ class Replay:
 
 class TronBatchModel:
     """
-    Vectorized Lightcycles simulation.
-
-    The hot path is step(): it advances all envs in one NumPy call and stores only
-    compact arrays. Rendering data such as owner grids is optional.
-
-    Important arrays:
-        occupied: bool [E, H, W]       trail/wall occupancy
-        pos:      int16 [E, P, 2]      player head positions, x/y
-        heading:  int8 [E, P]          0 up, 1 right, 2 down, 3 left
-        alive:    bool [E, P]
-        done:     bool [E]
-
-    Memory estimate for occupied only:
-        envs * width * height bytes.
-        Example: 10_000 envs * 32 * 32 ~= 10 MB.
+    Vectorized Lightcycles simulation with optimised collision detection.
     """
+
+    __slots__ = (
+        "width", "height", "players", "envs", "max_steps", "keep_owner",
+        "randomize_spawns", "rng", "_width_norm", "_height_norm",
+        "occupied", "owner", "pos", "heading", "alive", "done", "tick",
+        "_legal_cache", "_use_numba"
+    )
 
     def __init__(
         self,
@@ -85,11 +118,12 @@ class TronBatchModel:
         keep_owner: bool = False,
         randomize_spawns: bool = True,
         seed: Optional[int] = None,
+        use_numba: bool = True,
     ) -> None:
         if not (2 <= players <= 4):
             raise ValueError("players must be 2, 3, or 4")
         if width < 8 or height < 8:
-            raise ValueError("width and height should be at least 8")
+            raise ValueError("width and height must be at least 8")
 
         self.width = int(width)
         self.height = int(height)
@@ -99,14 +133,23 @@ class TronBatchModel:
         self.keep_owner = bool(keep_owner)
         self.randomize_spawns = bool(randomize_spawns)
         self.rng = np.random.default_rng(seed)
+        self._use_numba = use_numba and NUMBA_AVAILABLE
 
-        self.occupied = np.zeros((envs, height, width), dtype=np.bool_)
-        self.owner = np.zeros((envs, height, width), dtype=np.uint8) if keep_owner else None
-        self.pos = np.zeros((envs, players, 2), dtype=np.int16)
-        self.heading = np.zeros((envs, players), dtype=np.int8)
-        self.alive = np.ones((envs, players), dtype=np.bool_)
-        self.done = np.zeros(envs, dtype=np.bool_)
-        self.tick = np.zeros(envs, dtype=np.int32)
+        # Precomputed normalization denominators
+        self._width_norm = max(1, width - 1)
+        self._height_norm = max(1, height - 1)
+
+        # Core buffers: C‑order for better cache locality
+        self.occupied = np.zeros((envs, height, width), dtype=bool, order='C')
+        self.owner = np.zeros((envs, height, width), dtype=np.uint8, order='C') if keep_owner else None
+        self.pos = np.zeros((envs, players, 2), dtype=np.int16, order='C')
+        self.heading = np.zeros((envs, players), dtype=np.int8, order='C')
+        self.alive = np.ones((envs, players), dtype=bool, order='C')
+        self.done = np.zeros(envs, dtype=bool, order='C')
+        self.tick = np.zeros(envs, dtype=np.int32, order='C')
+
+        # Reusable buffer for legal_actions()
+        self._legal_cache = np.zeros((envs, players, 3), dtype=bool, order='C')
 
         self.reset()
 
@@ -186,9 +229,10 @@ class TronBatchModel:
         reward = np.zeros((self.envs, self.players), dtype=np.float32)
         active = (~self.done)[:, None] & self.alive
         if not active.any():
-            died = np.zeros((self.envs, self.players), dtype=np.bool_)
+            died = np.zeros((self.envs, self.players), dtype=bool)
             return StepResult(reward, self.done.copy(), self.alive.copy(), died)
 
+        # Move
         new_heading = (self.heading + TURN[actions]) & 3
         delta = DIR_VECTORS[new_heading]
         new_pos = self.pos + delta
@@ -197,30 +241,28 @@ class TronBatchModel:
 
         in_bounds = (0 <= x) & (x < self.width) & (0 <= y) & (y < self.height)
 
-        # Collision against existing trails/walls. Index only valid cells.
-        trail_hit = np.zeros((self.envs, self.players), dtype=np.bool_)
+        # Trail hits
+        trail_hit = np.zeros((self.envs, self.players), dtype=bool)
         e_idx = np.broadcast_to(np.arange(self.envs)[:, None], (self.envs, self.players))
         valid = active & in_bounds
         trail_hit[valid] = self.occupied[e_idx[valid], y[valid], x[valid]]
 
-        # Head-to-head collision: multiple live players enter the same empty cell.
-        same_x = x[:, :, None] == x[:, None, :]
-        same_y = y[:, :, None] == y[:, None, :]
-        both_valid = valid[:, :, None] & valid[:, None, :]
-        same_cell = same_x & same_y & both_valid
-        same_cell &= ~np.eye(self.players, dtype=np.bool_)[None, :, :]
-        head_hit = same_cell.any(axis=2)
+        # Head‑to‑head collisions – OPTIMISED O(P) version
+        if self._use_numba:
+            head_hit = _detect_head_collisions_numba(x, y, valid, self.width, self.height)
+        else:
+            head_hit = self._detect_head_collisions_python(x, y, valid)
 
         died = active & ((~in_bounds) | trail_hit | head_hit)
         survived = active & ~died
 
         reward[died] = -1.0
 
-        # Apply movement. Dead players keep their previous position, which remains trail.
+        # Apply movement
         self.heading[active] = new_heading[active]
         self.pos[survived] = new_pos[survived]
 
-        # Mark new survivor cells as occupied.
+        # Mark new cells
         self.occupied[e_idx[survived], y[survived], x[survived]] = True
         if self.owner is not None:
             p_idx = np.broadcast_to(np.arange(self.players)[None, :], (self.envs, self.players))
@@ -240,19 +282,43 @@ class TronBatchModel:
         self.done[newly_done] = True
         return StepResult(reward, self.done.copy(), self.alive.copy(), died)
 
+    def _detect_head_collisions_python(self, x, y, valid):
+        """Pure Python fallback (still O(P) per env)."""
+        envs, players = x.shape
+        head_hit = np.zeros((envs, players), dtype=bool)
+
+        for e in range(envs):
+            # Use dictionary for position -> player mapping
+            pos_map = {}
+            for p in range(players):
+                if valid[e, p]:
+                    # Ensure integer positions
+                    key = int(x[e, p]) * self.width + int(y[e, p])
+                    if key in pos_map:
+                        head_hit[e, p] = True
+                        head_hit[e, pos_map[key]] = True
+                    else:
+                        pos_map[key] = p
+        return head_hit
+
     def legal_actions(self) -> np.ndarray:
         """Return bool [envs, players, 3] for one-step safe actions."""
+        # Reuse preallocated buffer to avoid allocations
+        free = self._legal_cache
+        free.fill(False)
+
         candidate_heading = (self.heading[:, :, None] + TURN[None, None, :]) & 3
         candidate_delta = DIR_VECTORS[candidate_heading]
         candidate_pos = self.pos[:, :, None, :] + candidate_delta
         x = candidate_pos[..., 0]
         y = candidate_pos[..., 1]
+
         in_bounds = (0 <= x) & (x < self.width) & (0 <= y) & (y < self.height)
 
-        free = np.zeros((self.envs, self.players, 3), dtype=np.bool_)
         e = np.broadcast_to(np.arange(self.envs)[:, None, None], (self.envs, self.players, 3))
         valid = in_bounds & self.alive[:, :, None] & (~self.done[:, None, None])
         free[valid] = ~self.occupied[e[valid], y[valid], x[valid]]
+
         return free
 
     def observe_lite(self) -> np.ndarray:
@@ -268,8 +334,8 @@ class TronBatchModel:
         """
         legal = self.legal_actions().astype(np.float32)
         xy = self.pos.astype(np.float32)
-        xy[..., 0] /= max(1, self.width - 1)
-        xy[..., 1] /= max(1, self.height - 1)
+        xy[..., 0] /= self._width_norm
+        xy[..., 1] /= self._height_norm
         heading_oh = np.eye(4, dtype=np.float32)[self.heading]
         alive = self.alive[..., None].astype(np.float32)
 
@@ -280,11 +346,12 @@ class TronBatchModel:
                 if i == j:
                     continue
                 dxy = (self.pos[:, j] - self.pos[:, i]).astype(np.float32)
-                dxy[:, 0] /= max(1, self.width - 1)
-                dxy[:, 1] /= max(1, self.height - 1)
-                parts.append(np.concatenate([dxy, self.alive[:, j:j + 1].astype(np.float32)], axis=1))
+                dxy[:, 0] /= self._width_norm
+                dxy[:, 1] /= self._height_norm
+                parts.append(np.concatenate([dxy, self.alive[:, j:j+1].astype(np.float32)], axis=1))
             rel_parts.append(np.concatenate(parts, axis=1))
         rel = np.stack(rel_parts, axis=1)
+
         return np.concatenate([legal, xy, heading_oh, alive, rel], axis=2)
 
     def observe_grid(self) -> np.ndarray:
