@@ -77,6 +77,57 @@ class DeepQNetwork(nn.Module):
         x = self.fc_output(x)
 
         return x
+class MLPPolicy:
+    def __init__(self, obs_dim, hidden=32, genome=None, rng=None):
+        self.obs_dim = int(obs_dim)
+        self.hidden = int(hidden)
+        self.rng = np.random.default_rng(rng)
+
+        self.n_params = (
+            self.obs_dim * self.hidden + self.hidden +
+            self.hidden * 3 + 3
+        )
+
+        if genome is None:
+            genome = self.rng.normal(0, 0.1, size=self.n_params).astype(np.float32)
+        else:
+            genome = np.asarray(genome, dtype=np.float32)
+        self.genome = genome
+        self._unpack_genome(genome)
+
+    def _unpack_genome(self, genome):
+        assert genome.shape == (self.n_params,)
+        i = 0
+        n = self.obs_dim * self.hidden
+        self.w1 = genome[i:i+n].reshape(self.obs_dim, self.hidden)
+        i += n
+
+        self.b1 = genome[i:i+self.hidden]
+        i += self.hidden
+
+        n = self.hidden * 3
+        self.w2 = genome[i:i+n].reshape(self.hidden, 3)
+        i += n
+
+        self.b2 = genome[i:i+3]
+
+    def set_genome(self, genome):
+        genome = np.asarray(genome, dtype=np.float32)
+        self.genome = genome
+        self._unpack_genome(genome)
+
+    def get_genome(self):
+        return self.genome
+
+    def logits(self, observations):
+        # obs: [envs, players, obs_dim]
+        h = np.tanh(observations @ self.w1 + self.b1)
+        return h @ self.w2 + self.b2
+
+    def actions(self, model):
+        observations = model.observe_lite()
+        logits = self.logits(observations)
+        return logits.argmax(axis=-1).astype(np.int8)
 
 
 # Defines the agent that uses the DeepQNetwork to learn the optimal policy
